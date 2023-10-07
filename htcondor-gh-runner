@@ -1,0 +1,206 @@
+#!/usr/bin/python3
+
+import argparse
+import http.client
+import io
+import json
+import os
+import posixpath
+import pathlib
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+import htcondor
+import htcondor.dags
+
+
+class RunnerCreateException(Exception):
+    pass
+
+class ExistingWorkingDir(Exception):
+    pass
+
+
+# The script that is launched from inside the VM
+runTemplate = """#!/bin/sh
+
+cd /root/actions-runner
+exec ./config.sh --unattended --url {repo_url} --token {token} --name {runner_name} --replace --disableupdate --ephemeral > ./runner.stdout 2> ./runner.stderr
+"""
+
+
+def getRunnerToken(organization, repo, token):
+    conn = http.client.HTTPSConnection("api.github.com")
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": "Bearer " + token,
+        "User-Agent": "htcondor-gh-runner",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    conn.request("POST", posixpath.join("/repos", organization, repo, "actions/runners/registration-token"), None, headers)
+    
+    response = conn.getresponse()
+    data = response.read(1024*1024)
+    conn.close()
+    if response.status != 201:
+        try:
+            my_exception = RunnerCreateException(json.loads(data)['message'])
+        except:
+            raise RunnerCreateException(data.decode())
+        raise my_exception
+    return json.loads(data)['token']
+
+
+def generateDAG(working_dir, image_url, repo, org, token_file, max_runners):
+
+    fname = image_url.split("/")[-1]
+    runner_submit_description = htcondor.Submit({
+        "executable":              "github-runner", # Meaningless for a VM universe job; useful for status printing
+        "universe":                "vm",
+        "vm_type":                 "kvm",
+        "vm_memory":                2048,
+        "vm_networking":            True,
+        "vm_no_output_vm":          False,
+        "vm_vnc":                   False,
+        "vm_disk":                f"{fname}:vda:w:raw,input_disk_$(CLUSTER).qcow2:vdb:w:qcow2",
+        "request_disk":            "20GB",
+        "log":                     "github-runner-$(CLUSTER).log",
+        "should_transfer_files":   "YES",
+        "when_to_transfer_output": "ON_EXIT",
+        "requirements":            "(TARGET.HasVirshDefaultNetwork == True)",
+        "transfer_input_files":   f"{image_url},input_disk_$(CLUSTER).qcow2",
+        "transfer_output_files":   "input_disk_$(CLUSTER).qcow2",
+        "transfer_output_remaps":  "input_disk_$(CLUSTER).qcow2 = output_disk_$(CLUSTER).qcow2"
+    })
+
+    script_path = str(pathlib.Path(sys.argv[0]).absolute())
+    prescript = htcondor.dags.Script(
+        script_path,
+        arguments = ["prescript", "-r", repo, "-o", org, "-t", token_file, "--jobid", "$JOB",
+                     "--stdout", "prescript-$JOB-$RETRY.stdout", "--stderr", "prescript-$JOB-$RETRY.stderr",
+                     "--working-dir", working_dir]
+    )
+
+    postscript = htcondor.dags.Script(
+        script_path,
+        arguments = ["postscript", "-r", repo, "-o", org, "-t", token_file, "--jobid", "$JOB",
+                     "--stdout", "postscript-$JOB-$RETRY.stdout", "--stderr", "postscript-$JOB-$RETRY.stderr",
+                     "--working-dir", working_dir]
+    )
+
+    dag = htcondor.dags.DAG()
+    dag.layer(
+       name = "htcondor-GH-Runner",
+       submit_description = runner_submit_description,
+       vars = [{"node_name": f"Runner-{i}"} for i in range(max_runners)],
+       retries = int(1e6),
+       retry_unless_exit = 42,
+       pre = prescript,
+       post = postscript,
+    )
+
+    dag_dir = pathlib.Path(working_dir).absolute()
+    try:
+        dag_dir.mkdir()
+    except FileExistsError:
+        dir_str = str(dag_dir)
+        raise ExistingWorkingDir(f"Working directory, {dir_str}, already exists; remove to reuse")
+
+    dag_file = htcondor.dags.write_dag(dag, dag_dir)
+    dag_submit = htcondor.Submit.from_dag(str(dag_file))
+
+    os.chdir(dag_dir)
+    schedd = htcondor.Schedd()
+    submit_result = schedd.submit(dag_submit)
+    print("GitHub runners were submitted as DAG with JobID %d.0" % submit_result.cluster())
+
+
+def generateInputDisk(working_dir, repo_url, token, runner_name):
+    contents = runTemplate.format(
+        repo_url=repo_url,
+        token=token,
+        runner_name=runner_name,
+    )
+
+    output_file = pathlib.Path(working_dir) / f"input_disk_{runner_name.lower().replace('-', '_')}.qcow2"
+
+    with tempfile.NamedTemporaryFile("wb") as tarTempFile:
+        with tarfile.open(None, "w:gz", tarTempFile) as tobj:
+            tf = tarfile.TarInfo("run-job")
+            tf.size = len(contents)
+            tf.mode = 0O755
+            tobj.addfile(tf, io.BytesIO(contents.encode()))
+
+        result = subprocess.run(["virt-make-fs", "-F", "qcow2", "--size", "100MB", tarTempFile.name, output_file], check=True)
+
+
+def prescriptMain(args):
+    with open(args.token_file, 'r') as fp:
+        token = fp.read(1024*1024)
+        token = token.strip()
+
+    registration_token = getRunnerToken(args.org, args.repo, token)
+
+    repo_url = "https://github.com/" + posixpath.join(args.org, args.repo)
+    generateInputDisk(args.working_dir, repo_url, registration_token, args.jobid)
+
+
+def helperMain():
+    parser = argparse.ArgumentParser(description="Run the prescript for the HTCondor GitHub runners application")
+    parser.add_argument("command", help="Helper command to run", choices=["prescript", "postscript"])
+    parser.add_argument('-r', '--repo', help="GitHub repo the runner will attach to", default="")
+    parser.add_argument('-o', '--org', help="GitHub organization the runner will attach to", required=True)
+    parser.add_argument('-t', '--token-file', help="Path to a file containing the GitHub PAT with admin permissions", required=True)
+    parser.add_argument("-w", "--working-dir", help="Working directory for the DAG associated with the GitHub runners", default="working_dir")
+    parser.add_argument("-j", "--jobid", help="Job ID for the GitHub runner name", required=True)
+    parser.add_argument("--stdout", help="Location of standard output for script")
+    parser.add_argument("--stderr", help="Location of standard output for script")
+
+    args = parser.parse_args()
+
+    # DAG scripts notoriously have their stdout/err automatically set to
+    # /dev/null; based on the flags, redirect these somewhere more useful.
+    working_dir = pathlib.Path(args.working_dir)
+    if args.stdout:
+        new_stdout = working_dir / args.stdout
+        with open(new_stdout, 'w') as fp:
+            os.dup2(fp.fileno(), sys.stdout.fileno())
+    if args.stderr:
+        new_stderr = working_dir / args.stderr
+        with open(new_stderr, 'w') as fp:
+            os.dup2(fp.fileno(), sys.stderr.fileno())
+
+    if args.command == "prescript":
+        prescriptMain(args)
+    elif args.command == "postscript":
+        raise NotImplemented()
+
+
+def topMain():
+
+    parser = argparse.ArgumentParser(description="Run self-hosted GitHub runners from within a HTCondor system")
+    parser.add_argument('-r', '--repo', help="GitHub repo the runner will attach to", default="")
+    parser.add_argument('-o', '--org', help="GitHub organization the runner will attach to", required=True)
+    parser.add_argument('-t', '--token-file', help="Path to a file containing the GitHub PAT with admin permissions", required=True)
+    parser.add_argument("-w", "--working-dir", help="Working directory for the DAG associated with the GitHub runners", default="working_dir")
+    parser.add_argument("-i", "--image-url", help="URL to the GitHub runner VM image", default="osdf:///chtc/staging/bbockelm/packer_cache/alma_9.2.qcow2")
+    parser.add_argument("--max-runners", help="Maximum number of GitHub runners to execute", default=1, type=int)
+
+    args = parser.parse_args()
+
+    generateDAG(args.working_dir, args.image_url, args.repo, args.org, args.token_file, args.max_runners)
+
+
+def main():
+    # The same script serves as prescript, postscript, and the main driver.  We peek
+    # at argv[1] to see what we should do in order to avoid dumping confusing help
+    # options to the user
+    if len(sys.argv) > 1 and sys.argv[1] in ["prescript", "postscript"]:
+        return helperMain()
+
+    return topMain()
+
+if __name__ == '__main__':
+    main()
