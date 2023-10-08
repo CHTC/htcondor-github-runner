@@ -12,12 +12,20 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 
+import classad
 import htcondor
 import htcondor.dags
 
 
 class RunnerCreateException(Exception):
+    pass
+
+class RunnerQueryException(Exception):
+    pass
+
+class RunnerDeleteException(Exception):
     pass
 
 class ExistingWorkingDir(Exception):
@@ -35,6 +43,21 @@ chown runner: $ORIG_DIR/runner.stderr
 cd /home/runner/actions-runner
 runuser -u runner -- ./config.sh --unattended --url {repo_url} --token {token} --name {runner_name} --replace --disableupdate --ephemeral >> $ORIG_DIR/runner.stdout 2>> $ORIG_DIR/runner.stderr
 exec runuser -u runner -- ./run.sh >> $ORIG_DIR/runner.stdout 2>> $ORIG_DIR/runner.stderr
+"""
+
+# The service node template.  The dags library doesn't support SERVICE nodes
+# so we need to hand craft the job
+serviceTemplate = """
+universe = local
+executable = {exec}
++Arguments = strcat("service --group {group} --max-idle {max_idle} --org {org} --repo {repo} --token-file {token_file} --jobid ", DAGManJobId)
+environment = PYTHONUNBUFFERED=1
+log = {log_path}
+output = {output_path}
+error = {error_path}
+on_exit_remove = false
+
+queue 1
 """
 
 
@@ -60,20 +83,108 @@ def getRunnerToken(organization, repo, token):
     return json.loads(data)['token']
 
 
-def generateDAG(working_dir, image_url, repo, org, token_file, max_runners):
+def getRunnerStatus(prefix, organization, repo, token):
+    # curl -L -s  -H "Accept: application/vnd.github+json"   -H "$(cat token_header_file)"   -H "X-GitHub-Api-Version: 2022-11-28"   https://api.github.com/repos/bbockelm/pelican/actions/runners
+    conn = http.client.HTTPSConnection("api.github.com")
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": "Bearer " + token,
+        "User-Agent": "htcondor-gh-runner",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    conn.request("GET", posixpath.join("/repos", organization, repo, "actions/runners"), None, headers)
+
+    response = conn.getresponse()
+    data = response.read(1024*1024)
+    conn.close()
+    if response.status != 200:
+        try:
+            my_exception = RunnerQueryException(json.loads(data)['message'])
+        except:
+            raise RunnerQueryException(data.decode())
+        raise my_exception
+    busy = set()
+    idle = set()
+    offline = set()
+    for runner in json.loads(data)['runners']:
+        if not runner["name"].startswith(prefix):
+            continue
+        if runner["status"] == "offline":
+            offline.add(runner["id"])
+        if runner["busy"]:
+            busy.add(runner["id"])
+        else:
+            idle.add(runner["id"])
+    return busy, idle, offline
+
+
+def deleteRunner(organization, repo, runner_id, token):
+    conn = http.client.HTTPSConnection("api.github.com")
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": "Bearer " + token,
+        "User-Agent": "htcondor-gh-runner",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    print(f"Removing runner with ID {runner_id}")
+    conn.request("DELETE", posixpath.join("/repos", organization, repo, "actions/runners", str(runner_id)), None, headers)
+    response = conn.getresponse()
+    data = response.read(1024*1024)
+    conn.close()
+    if response.status != 204:
+        try:
+            my_exception = RunnerDeleteException(json.loads(data)['message'])
+        except:
+            raise RunnerDeleteException(data.decode())
+        raise my_exception
+
+
+def deleteIdle(organization, repo, idle, max_idle, token):
+    if len(idle) <= max_idle:
+        return
+
+    extra_runners = len(idle)-max_idle
+    print(f"There are {extra_runners} idle runners that should be removed")
+
+    for runner_id in list(idle)[:extra_runners]:
+        deleteRunner(organization, repo, runner_id, token)
+
+
+def deleteOffline(organization, repo, offline, token):
+    for runner_id in offline:
+        deleteRunner(organization, repo, runner_id, token)
+
+
+def maintainIdleLoop(prefix, organization, repo, token, jobid, max_idle):
+    while True:
+        print("Will sleep for 60 seconds then check for idle runners")
+        time.sleep(60)
+        busy, idle, offline = getRunnerStatus(prefix, organization, repo, token)
+        print(f"There were {len(idle)} idle runners and {len(offline)} offline runners")
+        deleteOffline(organization, repo, offline, token)
+        deleteIdle(organization, repo, idle, max_idle, token)
+        schedd = htcondor.Schedd()
+        desired_runners = int(len(busy) + max_idle)
+        print(f"With {len(busy)} busy runners and target of {max_idle} idle, setting maximum runners to {desired_runners}")
+        schedd.edit([f"{jobid}.0"], 'DAGMan_MaxJobs', str(desired_runners))
+
+
+def generateDAG(prefix, working_dir, image_url, repo, org, token_file, max_runners, max_idle, cores, memory_mb):
 
     fname = image_url.split("/")[-1]
     runner_submit_description = htcondor.Submit({
-        "executable":              "github-runner", # Meaningless for a VM universe job; useful for status printing
+        "executable":             f"$(JOB)", # Meaningless for a VM universe job; useful for status printing
         "universe":                "vm",
         "vm_type":                 "kvm",
-        "vm_memory":                2048,
         "vm_networking":            True,
         "vm_no_output_vm":          False,
         "vm_vnc":                   False,
         "vm_disk":                f"{fname}:vda:w:qcow2,input_disk_$(JOB).qcow2:vdb:w:qcow2",
         "request_disk":            "20GB",
-        "log":                     "github-runner-$(CLUSTER).log",
+        "request_cpus":             cores,
+        "vm_memory":                memory_mb,
+        "log":                    f"{prefix}-$(CLUSTER).log",
         "should_transfer_files":   "YES",
         "when_to_transfer_output": "ON_EXIT",
         "requirements":            "(TARGET.HasVirshDefaultNetwork == True)",
@@ -104,7 +215,7 @@ def generateDAG(working_dir, image_url, repo, org, token_file, max_runners):
 
     dag = htcondor.dags.DAG()
     dag.layer(
-       name = "htcondor-GH-Runner",
+       name = prefix,
        submit_description = runner_submit_description,
        vars = [{"node_name": f"Runner-{i}"} for i in range(max_runners)],
        retries = int(1e6),
@@ -121,7 +232,29 @@ def generateDAG(working_dir, image_url, repo, org, token_file, max_runners):
         raise ExistingWorkingDir(f"Working directory, {dir_str}, already exists; remove to reuse")
 
     dag_file = htcondor.dags.write_dag(dag, dag_dir, node_name_formatter=htcondor.dags.SimpleFormatter("_"))
-    dag_submit = htcondor.Submit.from_dag(str(dag_file))
+
+    # The service node and supporting submit file need to be explicitly written due
+    # to lack of support in the python library.
+    service_sub = serviceTemplate.format(
+        exec = script_path,
+        max_idle = max_idle,
+        group = prefix,
+        org = org,
+        repo = repo if repo else "''",
+        token_file = pathlib.Path(token_file).absolute(),
+        log_path = (dag_dir / f"service-$(Cluster).log").absolute(),
+        error_path = (dag_dir / f"service-$(Cluster).stderr").absolute(),
+        output_path = (dag_dir / f"service-$(Cluster).stdout").absolute(),
+    )
+    with open(dag_dir / "htcondor-GH-Runner-service.sub", "w") as fp:
+        fp.write(service_sub)
+    with open(dag_dir / "dagfile.dag", "a") as fp:
+        fp.write("\nSERVICE htcondor-GH-Service htcondor-GH-Runner-service.sub\n")
+
+    dag_submit = htcondor.Submit.from_dag(str(dag_file),{
+        'batch-name': prefix,
+        'maxjobs': max_idle # Start maximum number of runners at the maximum idle runners
+    })
 
     os.chdir(dag_dir)
     schedd = htcondor.Schedd()
@@ -149,6 +282,11 @@ def generateInputDisk(working_dir, repo_url, token, runner_name):
         with tempfile.NamedTemporaryFile("wb") as qcowTempFile:
             subprocess.run(["virt-make-fs", "-F", "qcow2", "--size", "100MB", tarTempFile.name, qcowTempFile.name], check=True)
             subprocess.run(["qemu-img", "convert", "-c", "-O", "qcow2", qcowTempFile.name, str(output_file)], check=True)
+
+
+def countDags(prefix):
+    schedd = htcondor.Schedd()
+    return len(list(schedd.query(constraint='JobBatchName =?= %s' % classad.quote(prefix), projection=[])))
 
 
 def prescriptMain(args):
@@ -181,15 +319,18 @@ def postscriptMain(args):
      os.unlink(str(output_disk_path))
      return 1
 
+
 def helperMain():
     parser = argparse.ArgumentParser(description="Run a script for the HTCondor GitHub runners application")
-    parser.add_argument("command", help="Helper command to run", choices=["prescript", "postscript"])
+    parser.add_argument("command", help="Helper command to run", choices=["prescript", "postscript", "service"])
     parser.add_argument('-r', '--repo', help="GitHub repo the runner will attach to", default="")
     parser.add_argument('-o', '--org', help="GitHub organization the runner will attach to", required=True)
     parser.add_argument('-t', '--token-file', help="Path to a file containing the GitHub PAT with admin permissions", required=True)
     parser.add_argument("-w", "--working-dir", help="Working directory for the DAG associated with the GitHub runners", default="working_dir")
-    parser.add_argument("-j", "--jobid", help="Job ID for the GitHub runner name", required=True)
+    parser.add_argument("-j", "--jobid", help="Job ID for the GitHub runner name")
+    parser.add_argument("--max-idle", help="Maximum number of idle runners to maintain", type=int)
     parser.add_argument("--retry", help="Retry number for the DAG node", type=int)
+    parser.add_argument("--group", help="Unique group name for GitHub runners", default="htcondor-gh-runner")
     parser.add_argument("--stdout", help="Location of standard output for script")
     parser.add_argument("--stderr", help="Location of standard output for script")
 
@@ -213,6 +354,11 @@ def helperMain():
         return prescriptMain(args)
     elif args.command == "postscript":
         return postscriptMain(args)
+    elif args.command == "service":
+        with open(args.token_file, 'r') as fp:
+            token = fp.read(1024*1024)
+            token = token.strip()
+        return maintainIdleLoop(args.group, args.org, args.repo, token, args.jobid, args.max_idle)
 
 
 def topMain():
@@ -223,7 +369,11 @@ def topMain():
     parser.add_argument('-t', '--token-file', help="Path to a file containing the GitHub PAT with admin permissions", required=True)
     parser.add_argument("-w", "--working-dir", help="Working directory for the DAG associated with the GitHub runners", default="working_dir")
     parser.add_argument("-i", "--image-url", help="URL to the GitHub runner VM image", default="osdf:///chtc/PUBLIC/bbockelm/alma_9.2-v4.qcow2")
-    parser.add_argument("--max-runners", help="Maximum number of GitHub runners to execute", default=1, type=int)
+    parser.add_argument("--max-runners", help="Maximum number of GitHub runners to execute", default=10, type=int)
+    parser.add_argument("--max-idle", help="Maximum number of idle GitHub runners to maintain", default=3, type=int)
+    parser.add_argument("--group", help="Unique group name for GitHub runners", default="htcondor-gh-runner")
+    parser.add_argument("--runner-cores", help="Number of cores for each GitHub runner VM", default=1, type=int)
+    parser.add_argument("--runner-memory", help="RAM (in megabytes) per GitHub runner VM", default=2048, type=int)
 
     args = parser.parse_args()
 
@@ -231,7 +381,12 @@ def topMain():
         print(f"Token file, {args.token_file}, does not exist", file=sys.stderr)
         return 3
 
-    generateDAG(args.working_dir, args.image_url, args.repo, args.org, args.token_file, args.max_runners)
+    if countDags(args.group):
+        print(f"Cannot submit new runner group named {args.group}; one already exists in queue")
+        return 2
+
+    generateDAG(args.group, args.working_dir, args.image_url, args.repo, args.org, args.token_file, args.max_runners, args.max_idle,
+        args.runner_cores, args.runner_memory)
     return 0
 
 
@@ -239,7 +394,7 @@ def main():
     # The same script serves as prescript, postscript, and the main driver.  We peek
     # at argv[1] to see what we should do in order to avoid dumping confusing help
     # options to the user
-    if len(sys.argv) > 1 and sys.argv[1] in ["prescript", "postscript"]:
+    if len(sys.argv) > 1 and sys.argv[1] in ["prescript", "postscript", "service"]:
         return helperMain()
 
     return topMain()
