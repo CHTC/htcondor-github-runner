@@ -7,6 +7,7 @@ import json
 import os
 import posixpath
 import pathlib
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -26,8 +27,14 @@ class ExistingWorkingDir(Exception):
 # The script that is launched from inside the VM
 runTemplate = """#!/bin/sh
 
-cd /root/actions-runner
-exec ./config.sh --unattended --url {repo_url} --token {token} --name {runner_name} --replace --disableupdate --ephemeral > ./runner.stdout 2> ./runner.stderr
+ORIG_DIR=/mnt/user
+touch $ORIG_DIR/runner.stdout
+touch $ORIG_DIR/runner.stderr
+chown runner: $ORIG_DIR/runner.stdout
+chown runner: $ORIG_DIR/runner.stderr
+cd /home/runner/actions-runner
+runuser -u runner -- ./config.sh --unattended --url {repo_url} --token {token} --name {runner_name} --replace --disableupdate --ephemeral >> $ORIG_DIR/runner.stdout 2>> $ORIG_DIR/runner.stderr
+exec runuser -u runner -- ./run.sh >> $ORIG_DIR/runner.stdout 2>> $ORIG_DIR/runner.stderr
 """
 
 
@@ -64,30 +71,35 @@ def generateDAG(working_dir, image_url, repo, org, token_file, max_runners):
         "vm_networking":            True,
         "vm_no_output_vm":          False,
         "vm_vnc":                   False,
-        "vm_disk":                f"{fname}:vda:w:raw,input_disk_$(CLUSTER).qcow2:vdb:w:qcow2",
+        "vm_disk":                f"{fname}:vda:w:qcow2,input_disk_$(JOB).qcow2:vdb:w:qcow2",
         "request_disk":            "20GB",
         "log":                     "github-runner-$(CLUSTER).log",
         "should_transfer_files":   "YES",
         "when_to_transfer_output": "ON_EXIT",
         "requirements":            "(TARGET.HasVirshDefaultNetwork == True)",
-        "transfer_input_files":   f"{image_url},input_disk_$(CLUSTER).qcow2",
-        "transfer_output_files":   "input_disk_$(CLUSTER).qcow2",
-        "transfer_output_remaps":  "input_disk_$(CLUSTER).qcow2 = output_disk_$(CLUSTER).qcow2"
+        "transfer_input_files":   f"{image_url},input_disk_$(JOB).qcow2",
+        "transfer_output_files":   "input_disk_$(JOB).qcow2",
+        "transfer_output_remaps":  '"input_disk_$(JOB).qcow2 = output_disk_$(JOB)_$(RETRY).qcow2"'
     })
 
     script_path = str(pathlib.Path(sys.argv[0]).absolute())
+    working_dir_path = pathlib.Path(working_dir)
     prescript = htcondor.dags.Script(
         script_path,
-        arguments = ["prescript", "-r", repo, "-o", org, "-t", token_file, "--jobid", "$JOB",
-                     "--stdout", "prescript-$JOB-$RETRY.stdout", "--stderr", "prescript-$JOB-$RETRY.stderr",
-                     "--working-dir", working_dir]
+        arguments = ["prescript", "-r", repo, "-o", org, "-t", str(pathlib.Path(token_file).absolute()),
+                     "--jobid", "$JOB", "--retry", "$RETRY",
+                     "--stdout", str((working_dir_path / "prescript.stdout").absolute()),
+                     "--stderr", str((working_dir_path / "prescript.stderr").absolute()),
+                     "--working-dir", working_dir_path.absolute()]
     )
 
     postscript = htcondor.dags.Script(
         script_path,
-        arguments = ["postscript", "-r", repo, "-o", org, "-t", token_file, "--jobid", "$JOB",
-                     "--stdout", "postscript-$JOB-$RETRY.stdout", "--stderr", "postscript-$JOB-$RETRY.stderr",
-                     "--working-dir", working_dir]
+        arguments = ["postscript", "-r", repo, "-o", org, "-t", str(pathlib.Path(token_file).absolute()),
+                     "--jobid", "$JOB", "--retry", "$RETRY",
+                     "--stdout", str((working_dir_path / "postscript.stdout").absolute()),
+                     "--stderr", str((working_dir_path / "postscript.stderr").absolute()),
+                     "--working-dir", working_dir_path.absolute()]
     )
 
     dag = htcondor.dags.DAG()
@@ -108,7 +120,7 @@ def generateDAG(working_dir, image_url, repo, org, token_file, max_runners):
         dir_str = str(dag_dir)
         raise ExistingWorkingDir(f"Working directory, {dir_str}, already exists; remove to reuse")
 
-    dag_file = htcondor.dags.write_dag(dag, dag_dir)
+    dag_file = htcondor.dags.write_dag(dag, dag_dir, node_name_formatter=htcondor.dags.SimpleFormatter("_"))
     dag_submit = htcondor.Submit.from_dag(str(dag_file))
 
     os.chdir(dag_dir)
@@ -124,7 +136,7 @@ def generateInputDisk(working_dir, repo_url, token, runner_name):
         runner_name=runner_name,
     )
 
-    output_file = pathlib.Path(working_dir) / f"input_disk_{runner_name.lower().replace('-', '_')}.qcow2"
+    output_file = (pathlib.Path(working_dir) / f"input_disk_{runner_name}.qcow2").absolute()
 
     with tempfile.NamedTemporaryFile("wb") as tarTempFile:
         with tarfile.open(None, "w:gz", tarTempFile) as tobj:
@@ -132,8 +144,11 @@ def generateInputDisk(working_dir, repo_url, token, runner_name):
             tf.size = len(contents)
             tf.mode = 0O755
             tobj.addfile(tf, io.BytesIO(contents.encode()))
+        tarTempFile.flush()
 
-        result = subprocess.run(["virt-make-fs", "-F", "qcow2", "--size", "100MB", tarTempFile.name, output_file], check=True)
+        with tempfile.NamedTemporaryFile("wb") as qcowTempFile:
+            subprocess.run(["virt-make-fs", "-F", "qcow2", "--size", "100MB", tarTempFile.name, qcowTempFile.name], check=True)
+            subprocess.run(["qemu-img", "convert", "-c", "-O", "qcow2", qcowTempFile.name, str(output_file)], check=True)
 
 
 def prescriptMain(args):
@@ -147,14 +162,34 @@ def prescriptMain(args):
     generateInputDisk(args.working_dir, repo_url, registration_token, args.jobid)
 
 
+def createFilename(fname, jobid, retry):
+    fname_split = fname.rsplit(".", 1)
+    if len(fname_split) == 2:
+        return f"{fname_split[0]}-{jobid.replace(':', '_')}-{retry}.{fname_split[1]}"
+    return f"{fname}-{jobid}-{retry}"
+
+
+def postscriptMain(args):
+     working_dir_path = pathlib.Path(args.working_dir).absolute()
+     name_suffix = f"{args.jobid.lower().replace('-', '_').replace(':', '_')}_{args.retry}"
+     output_disk_path = working_dir_path / f"output_disk_{args.jobid}_{args.retry}.qcow2"
+     with tempfile.TemporaryDirectory() as td:
+         subprocess.run(["guestfish", "add", str(output_disk_path.absolute()), ":", "run", ":", "mount", "/dev/sda", "/", ":", "copy-out", "/runner.stdout", "/runner.stderr", td])
+         dirpath = pathlib.Path(td)
+         shutil.move(dirpath / "runner.stdout", working_dir_path / f"runner_{name_suffix}.stdout")
+         shutil.move(dirpath / "runner.stderr", working_dir_path / f"runner_{name_suffix}.stderr")
+     os.unlink(str(output_disk_path))
+     return 1
+
 def helperMain():
-    parser = argparse.ArgumentParser(description="Run the prescript for the HTCondor GitHub runners application")
+    parser = argparse.ArgumentParser(description="Run a script for the HTCondor GitHub runners application")
     parser.add_argument("command", help="Helper command to run", choices=["prescript", "postscript"])
     parser.add_argument('-r', '--repo', help="GitHub repo the runner will attach to", default="")
     parser.add_argument('-o', '--org', help="GitHub organization the runner will attach to", required=True)
     parser.add_argument('-t', '--token-file', help="Path to a file containing the GitHub PAT with admin permissions", required=True)
     parser.add_argument("-w", "--working-dir", help="Working directory for the DAG associated with the GitHub runners", default="working_dir")
     parser.add_argument("-j", "--jobid", help="Job ID for the GitHub runner name", required=True)
+    parser.add_argument("--retry", help="Retry number for the DAG node", type=int)
     parser.add_argument("--stdout", help="Location of standard output for script")
     parser.add_argument("--stderr", help="Location of standard output for script")
 
@@ -164,18 +199,20 @@ def helperMain():
     # /dev/null; based on the flags, redirect these somewhere more useful.
     working_dir = pathlib.Path(args.working_dir)
     if args.stdout:
-        new_stdout = working_dir / args.stdout
+        stdout_name = createFilename(args.stdout, args.jobid, args.retry)
+        new_stdout = working_dir / stdout_name
         with open(new_stdout, 'w') as fp:
             os.dup2(fp.fileno(), sys.stdout.fileno())
     if args.stderr:
-        new_stderr = working_dir / args.stderr
+        stderr_name = createFilename(args.stderr, args.jobid, args.retry)
+        new_stderr = working_dir / stderr_name
         with open(new_stderr, 'w') as fp:
             os.dup2(fp.fileno(), sys.stderr.fileno())
 
     if args.command == "prescript":
-        prescriptMain(args)
+        return prescriptMain(args)
     elif args.command == "postscript":
-        raise NotImplemented()
+        return postscriptMain(args)
 
 
 def topMain():
@@ -185,12 +222,17 @@ def topMain():
     parser.add_argument('-o', '--org', help="GitHub organization the runner will attach to", required=True)
     parser.add_argument('-t', '--token-file', help="Path to a file containing the GitHub PAT with admin permissions", required=True)
     parser.add_argument("-w", "--working-dir", help="Working directory for the DAG associated with the GitHub runners", default="working_dir")
-    parser.add_argument("-i", "--image-url", help="URL to the GitHub runner VM image", default="osdf:///chtc/staging/bbockelm/packer_cache/alma_9.2.qcow2")
+    parser.add_argument("-i", "--image-url", help="URL to the GitHub runner VM image", default="osdf:///chtc/PUBLIC/bbockelm/alma_9.2-v4.qcow2")
     parser.add_argument("--max-runners", help="Maximum number of GitHub runners to execute", default=1, type=int)
 
     args = parser.parse_args()
 
+    if not os.path.exists(args.token_file):
+        print(f"Token file, {args.token_file}, does not exist", file=sys.stderr)
+        return 3
+
     generateDAG(args.working_dir, args.image_url, args.repo, args.org, args.token_file, args.max_runners)
+    return 0
 
 
 def main():
@@ -203,4 +245,4 @@ def main():
     return topMain()
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
